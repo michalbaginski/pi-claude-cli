@@ -39,12 +39,6 @@ import { createEventBridge } from "./event-bridge.js";
 import { handleControlRequest } from "./control-handler.js";
 import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
-import {
-  getSessionId,
-  setSessionId,
-  clearSessionId,
-} from "./session-manager.js";
-
 /** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
 const INACTIVITY_TIMEOUT_MS = 180_000;
 
@@ -87,8 +81,13 @@ export function streamViaCli(
     try {
       const cwd = options?.cwd ?? process.cwd();
 
-      // Check for an existing session to resume
-      const resumeSessionId = getSessionId(cwd);
+      // Resume if pi provides a session ID AND this isn't the first turn.
+      // Pi passes sessionId on every call (including first), but we can only
+      // --resume a CLI session that already exists on disk from a prior turn.
+      const resumeSessionId =
+        options?.sessionId && context.messages.length > 1
+          ? options.sessionId
+          : undefined;
 
       // Build prompt: if resuming, only send the latest user turn;
       // otherwise build the full flattened conversation history
@@ -113,6 +112,7 @@ export function streamViaCli(
         effort,
         mcpConfigPath: options?.mcpConfigPath,
         resumeSessionId,
+        newSessionId: !resumeSessionId ? options?.sessionId : undefined,
       });
       const getStderr = captureStderr(proc);
 
@@ -183,7 +183,6 @@ export function streamViaCli(
       // Handle process error -- use endStreamWithError for guard
       proc.on("error", (err: Error) => {
         if (broken) return; // Break-early killed the process intentionally
-        clearSessionId(cwd); // Session may be corrupt after error
         const stderr = getStderr();
         endStreamWithError(stderr || err.message);
       });
@@ -193,7 +192,6 @@ export function streamViaCli(
         clearTimeout(inactivityTimer);
         if (broken) return; // Break-early kill, expected
         if (code !== 0 && code !== null) {
-          clearSessionId(cwd); // Session may be corrupt after crash
           const stderr = getStderr();
           const message = stderr
             ? `Claude CLI exited with code ${code}: ${stderr.trim()}`
@@ -216,11 +214,6 @@ export function streamViaCli(
 
         const msg = parseLine(line);
         if (!msg) return;
-
-        // Capture session_id from system init message (arrives early, before result)
-        if (msg.type === "system" && msg.session_id) {
-          setSessionId(cwd, msg.session_id);
-        }
 
         if (msg.type === "stream_event") {
           bridge.handleEvent(msg.event);
@@ -251,12 +244,7 @@ export function streamViaCli(
           handleControlRequest(msg, proc!.stdin!);
         } else if (msg.type === "result") {
           if (msg.subtype === "error") {
-            // Clear session on error so next request starts fresh
-            clearSessionId(cwd);
             endStreamWithError(msg.error ?? "Unknown error from Claude CLI");
-          } else if (msg.session_id) {
-            // Capture session_id for resuming on the next request
-            setSessionId(cwd, msg.session_id);
           }
           // For both success and error: clean up the subprocess
           clearTimeout(inactivityTimer);
