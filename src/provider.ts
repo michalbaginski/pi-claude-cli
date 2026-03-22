@@ -16,9 +16,10 @@
 
 import { createInterface } from "node:readline";
 import {
-  AssistantMessageEventStream,
+  createAssistantMessageEventStream,
   type Model,
   type SimpleStreamOptions,
+  type AssistantMessageEventStream,
 } from "@mariozechner/pi-ai";
 import {
   buildPrompt,
@@ -75,9 +76,7 @@ export function streamViaCli(
   context: { messages: any[]; systemPrompt?: string },
   options?: StreamViaCLiOptions,
 ): AssistantMessageEventStream {
-  // @ts-expect-error — tsc can't verify AssistantMessageEventStream is a value
-  // through pi-ai's `export *` re-export chain. The class constructor exists at runtime.
-  const stream = new AssistantMessageEventStream();
+  const stream = createAssistantMessageEventStream();
 
   (async () => {
     let proc: ReturnType<typeof spawnClaude> | undefined;

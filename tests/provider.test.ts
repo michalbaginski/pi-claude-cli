@@ -66,6 +66,9 @@ const { MockAssistantMessageEventStream } = vi.hoisted(() => {
 vi.mock("@mariozechner/pi-ai", () => ({
   getModels: vi.fn(() => mockModels),
   AssistantMessageEventStream: MockAssistantMessageEventStream,
+  createAssistantMessageEventStream: vi.fn(
+    () => new (MockAssistantMessageEventStream as any)(),
+  ),
   calculateCost: vi.fn(),
 }));
 
