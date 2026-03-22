@@ -14,6 +14,12 @@ The extension registers as a custom pi provider exposing all Claude models. Each
 
 ## Installation
 
+For vanilla `pi`:
+
+```bash
+pi install npm:pi-claude-cli
+```
+
 Add to `~/.gsd/agent/settings.json`:
 
 ```json

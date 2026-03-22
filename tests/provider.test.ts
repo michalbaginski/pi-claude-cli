@@ -6,7 +6,10 @@ import { PassThrough } from "node:stream";
 vi.mock("cross-spawn", () => ({
   default: vi.fn(() => {
     const proc = new EventEmitter();
-    const stdin = { write: vi.fn(), end: vi.fn() };
+    const stdin = Object.assign(new EventEmitter(), {
+      write: vi.fn(),
+      end: vi.fn(),
+    });
     const stdout = new PassThrough();
     const stderr = new EventEmitter();
     (proc as any).stdin = stdin;
@@ -287,6 +290,93 @@ describe("streamViaCli", () => {
     expect(doneEvent).toBeDefined();
     expect(doneEvent.message.content).toBeDefined();
     expect(mockStream.end).toHaveBeenCalled();
+  });
+
+  it("normalizes context limit result errors into a clear message", async () => {
+    const model = mockModels[0] as any;
+    const context = {
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    streamViaCli(model, context);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const proc = (spawn as any).mock.results[0].value;
+    proc.stdout.write(
+      JSON.stringify({
+        type: "result",
+        subtype: "error",
+        error: "Prompt is too long for this model",
+      }) + "\n",
+    );
+    proc.stdout.end();
+    await vi.advanceTimersByTimeAsync(100);
+
+    const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+    const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+    expect(doneEvent).toBeDefined();
+    expect(doneEvent.message.content[0].text).toContain("Context too long:");
+    expect(doneEvent.message.content[0].text).toContain(
+      "Prompt is too long for this model",
+    );
+  });
+
+  it("treats Claude CLI success results marked is_error as failures", async () => {
+    const model = mockModels[0] as any;
+    const context = {
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    streamViaCli(model, context);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const proc = (spawn as any).mock.results[0].value;
+    proc.stdout.write(
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        result: "Prompt is too long",
+      }) + "\n",
+    );
+    proc.stdout.end();
+    await vi.advanceTimersByTimeAsync(100);
+
+    const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+    const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+    expect(doneEvent).toBeDefined();
+    expect(doneEvent.message.content[0].text).toContain("Context too long:");
+    expect(doneEvent.message.content[0].text).toContain("Prompt is too long");
+  });
+
+  it("ignores stdin EPIPE so the real CLI error can still surface", async () => {
+    const model = mockModels[0] as any;
+    const context = {
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    streamViaCli(model, context);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const proc = (spawn as any).mock.results[0].value;
+    proc.stdin.emit("error", Object.assign(new Error("write EPIPE"), {
+      code: "EPIPE",
+    }));
+    proc.stdout.write(
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        result: "Prompt is too long",
+      }) + "\n",
+    );
+    proc.stdout.end();
+    await vi.advanceTimersByTimeAsync(100);
+
+    const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+    const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+    expect(doneEvent).toBeDefined();
+    expect(doneEvent.message.content[0].text).toContain("Context too long:");
   });
 
   it("calls cleanupProcess after receiving result", async () => {
@@ -1181,6 +1271,33 @@ describe("streamViaCli", () => {
       );
       expect(doneEvent).toBeDefined();
       expect(doneEvent.message.content).toBeDefined();
+    });
+
+    it("surfaces context limit crashes without wrapping them as generic exit-code failures", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stderr.emit(
+        "data",
+        Buffer.from("Prompt is too long for this model"),
+      );
+      proc.emit("close", 1, null);
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(doneEvent).toBeDefined();
+      expect(doneEvent.message.content[0].text).toContain("Context too long:");
+      expect(doneEvent.message.content[0].text).not.toContain(
+        "exited with code 1",
+      );
     });
 
     it("does not push error on normal close (code 0)", async () => {
