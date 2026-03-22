@@ -74,10 +74,7 @@ vi.mock("@mariozechner/pi-ai", () => ({
 
 import spawn from "cross-spawn";
 import { streamViaCli } from "../src/provider";
-import {
-  clearAllSessionIds,
-  getSessionId,
-} from "../src/session-manager";
+import { clearAllSessionIds, getSessionId } from "../src/session-manager";
 
 describe("provider registration (default export)", () => {
   it("registers provider with ID pi-claude-cli", async () => {
