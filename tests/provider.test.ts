@@ -71,6 +71,10 @@ vi.mock("@mariozechner/pi-ai", () => ({
 
 import spawn from "cross-spawn";
 import { streamViaCli } from "../src/provider";
+import {
+  clearAllSessionIds,
+  getSessionId,
+} from "../src/session-manager";
 
 describe("provider registration (default export)", () => {
   it("registers provider with ID pi-claude-cli", async () => {
@@ -125,10 +129,12 @@ describe("streamViaCli", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
+    clearAllSessionIds();
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    clearAllSessionIds();
   });
 
   it("returns an AssistantMessageEventStream", () => {
@@ -1787,6 +1793,217 @@ describe("streamViaCli", () => {
   });
 
   describe("session resume via options.sessionId", () => {
+    it("captures session_id from result and resumes automatically on next call", async () => {
+      const model = mockModels[0] as any;
+
+      const context1 = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context1);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc1 = (spawn as any).mock.results[0].value;
+      const args1 = (spawn as any).mock.calls[0][1] as string[];
+      expect(args1).not.toContain("--resume");
+
+      const firstTurnLines = [
+        JSON.stringify({
+          type: "system",
+          subtype: "init",
+          session_id: "sess-first",
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 10, output_tokens: 0 } },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "message_stop" },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          session_id: "sess-first",
+          result: "ok",
+        }),
+      ];
+
+      for (const line of firstTurnLines) {
+        proc1.stdout.write(line + "\n");
+      }
+      proc1.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(getSessionId(process.cwd())).toBe("sess-first");
+
+      const context2 = {
+        messages: [
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Hi there" },
+          { role: "user", content: "Follow-up" },
+        ],
+      };
+
+      streamViaCli(model, context2);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args2 = (spawn as any).mock.calls[1][1] as string[];
+      expect(args2).toContain("--resume");
+      const resumeIdx = args2.indexOf("--resume");
+      expect(args2[resumeIdx + 1]).toBe("sess-first");
+
+      const proc2 = (spawn as any).mock.results[1].value;
+      const written = proc2.stdin.write.mock.calls[0][0] as string;
+      const parsed = JSON.parse(written.trim());
+      expect(parsed.message.content).toBe("Follow-up");
+    });
+
+    it("clears stored session on CLI error result and falls back to full prompt", async () => {
+      const model = mockModels[0] as any;
+
+      const context1 = {
+        messages: [{ role: "user", content: "Hello" }],
+      };
+
+      streamViaCli(model, context1);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc1 = (spawn as any).mock.results[0].value;
+      const successLines = [
+        JSON.stringify({
+          type: "system",
+          subtype: "init",
+          session_id: "sess-good",
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 10, output_tokens: 0 } },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "message_stop" },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          session_id: "sess-good",
+          result: "ok",
+        }),
+      ];
+
+      for (const line of successLines) {
+        proc1.stdout.write(line + "\n");
+      }
+      proc1.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(getSessionId(process.cwd())).toBe("sess-good");
+
+      const context2 = {
+        messages: [
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Hi" },
+          { role: "user", content: "Break things" },
+        ],
+      };
+
+      streamViaCli(model, context2);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc2 = (spawn as any).mock.results[1].value;
+      proc2.stdout.write(
+        JSON.stringify({
+          type: "result",
+          subtype: "error",
+          error: "Something failed",
+        }) + "\n",
+      );
+      proc2.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(getSessionId(process.cwd())).toBeUndefined();
+
+      const context3 = {
+        messages: [{ role: "user", content: "Try again" }],
+      };
+
+      streamViaCli(model, context3);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args3 = (spawn as any).mock.calls[2][1] as string[];
+      expect(args3).not.toContain("--resume");
+    });
+
+    it("captures session_id from system init before break-early result handling", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Read a file" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      const lines = [
+        JSON.stringify({
+          type: "system",
+          subtype: "init",
+          session_id: "sess-break-early",
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 10, output_tokens: 0 } },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: {
+              type: "tool_use",
+              id: "tool_read",
+              name: "Read",
+              input: "",
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_stop", index: 0 },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_delta",
+            delta: { stop_reason: "tool_use" },
+            usage: { output_tokens: 5 },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "message_stop" },
+        }),
+      ];
+
+      for (const line of lines) {
+        proc.stdout.write(line + "\n");
+      }
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(getSessionId(process.cwd())).toBe("sess-break-early");
+    });
+
     it("passes --resume when sessionId option is provided on subsequent turn", async () => {
       const model = mockModels[0] as any;
       const context = {
