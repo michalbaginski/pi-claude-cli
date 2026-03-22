@@ -225,6 +225,32 @@ describe("createEventBridge", () => {
     });
   });
 
+  describe("ephemeral status streaming", () => {
+    it("streams temporary status text without keeping it in the final output", () => {
+      const bridge = createBridgeWithStart();
+
+      bridge.emitEphemeralStatus("Agent: running Read src/provider.ts");
+
+      expect(stream.push).toHaveBeenCalledTimes(3);
+      expect(stream.events[0]).toMatchObject({
+        type: "text_start",
+        contentIndex: 0,
+      });
+      expect(stream.events[1]).toMatchObject({
+        type: "text_delta",
+        contentIndex: 0,
+        delta: "Agent: running Read src/provider.ts",
+      });
+      expect(stream.events[2]).toMatchObject({
+        type: "text_end",
+        contentIndex: 0,
+        content: "Agent: running Read src/provider.ts",
+      });
+
+      expect(bridge.getFinalOutput().content).toEqual([]);
+    });
+  });
+
   describe("message_delta handling", () => {
     it("captures stop_reason from message_delta", () => {
       const bridge = createEventBridge(stream as any, model as any);

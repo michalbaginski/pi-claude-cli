@@ -1126,6 +1126,306 @@ describe("streamViaCli", () => {
       vi.advanceTimersByTime(500);
     });
 
+    it("surfaces sub-agent tool progress without polluting the final assistant message", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Run an agent" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+
+      const lines = [
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 10, output_tokens: 0 } },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: {
+              type: "tool_use",
+              id: "agent_1",
+              name: "Agent",
+            },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_stop", index: 0 },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_delta",
+            delta: { stop_reason: "tool_use" },
+            usage: { output_tokens: 5 },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "message_stop" },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: {
+              type: "tool_use",
+              id: "read_1",
+              name: "Read",
+            },
+          },
+          parent_tool_use_id: "agent_1",
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "input_json_delta",
+              partial_json: '{"file_path":"src/provider.ts"}',
+            },
+          },
+          parent_tool_use_id: "agent_1",
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_stop", index: 0 },
+          parent_tool_use_id: "agent_1",
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 20, output_tokens: 0 } },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "Agent found the code." },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_stop", index: 0 },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 10 },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "message_stop" },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          result: "Agent found the code.",
+        }),
+      ];
+
+      for (const line of lines) {
+        proc.stdout.write(line + "\n");
+      }
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const progressEvent = mockStream._events.find(
+        (e: any) =>
+          e.type === "text_delta" &&
+          e.delta === "Agent: running Read src/provider.ts",
+      );
+      expect(progressEvent).toBeDefined();
+
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(doneEvent).toBeDefined();
+      expect(doneEvent.message.content).toEqual([
+        { type: "text", text: "Agent found the code." },
+      ]);
+    });
+
+    it("surfaces real Claude task_progress system messages for Agent runs", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [{ role: "user", content: "Run an agent" }],
+      };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+
+      const lines = [
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 10, output_tokens: 0 } },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: {
+              type: "tool_use",
+              id: "agent_1",
+              name: "Agent",
+            },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_stop", index: 0 },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "system",
+          subtype: "task_started",
+          tool_use_id: "agent_1",
+          description: "Find INACTIVITY_TIMEOUT_MS value",
+        }),
+        JSON.stringify({
+          type: "system",
+          subtype: "task_progress",
+          tool_use_id: "agent_1",
+          description: "Reading src/provider.ts",
+          last_tool_name: "Read",
+        }),
+        JSON.stringify({
+          type: "system",
+          subtype: "task_notification",
+          tool_use_id: "agent_1",
+          status: "completed",
+          summary: "Find INACTIVITY_TIMEOUT_MS value",
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { usage: { input_tokens: 20, output_tokens: 0 } },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "text_delta",
+              text: "The agent found that INACTIVITY_TIMEOUT_MS is 180_000.",
+            },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_stop", index: 0 },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 10 },
+          },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "message_stop" },
+          parent_tool_use_id: null,
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          result: "The agent found that INACTIVITY_TIMEOUT_MS is 180_000.",
+        }),
+      ];
+
+      for (const line of lines) {
+        proc.stdout.write(line + "\n");
+      }
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      expect(
+        mockStream._events.find(
+          (e: any) =>
+            e.type === "text_delta" &&
+            e.delta === "Agent: running Read src/provider.ts",
+        ),
+      ).toBeDefined();
+
+      expect(
+        mockStream._events.find(
+          (e: any) =>
+            e.type === "text_delta" &&
+            e.delta === "Agent: started Find INACTIVITY_TIMEOUT_MS value",
+        ),
+      ).toBeDefined();
+
+      const doneEvent = mockStream._events.find((e: any) => e.type === "done");
+      expect(doneEvent.message.content).toEqual([
+        {
+          type: "text",
+          text: "The agent found that INACTIVITY_TIMEOUT_MS is 180_000.",
+        },
+      ]);
+    });
+
     it("does NOT break-early when only user MCP tools are seen (not custom-tools)", async () => {
       const model = mockModels[0] as any;
       const context = {

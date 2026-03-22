@@ -39,6 +39,7 @@ import { createEventBridge } from "./event-bridge.js";
 import { handleControlRequest } from "./control-handler.js";
 import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
+import { createSubAgentProgressTracker } from "./subagent-progress.js";
 /** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
 const INACTIVITY_TIMEOUT_MS = 180_000;
 const CONTEXT_LIMIT_ERROR_PATTERNS = [
@@ -163,6 +164,7 @@ export function streamViaCli(
 
       // Create event bridge (before endStreamWithError so bridge is in scope)
       const bridge = createEventBridge(stream, model);
+      const subAgentProgress = createSubAgentProgressTracker();
 
       // Guard against double stream.end() and double error events.
       // First error path wins; subsequent ones are no-ops.
@@ -180,7 +182,7 @@ export function streamViaCli(
       function endStreamWithError(errMsg: string) {
         if (streamEnded || broken) return;
         streamEnded = true;
-        const output = bridge.getOutput();
+        const output = bridge.getFinalOutput();
         const errorMessage = {
           ...output,
           content: output.content?.length
@@ -278,9 +280,17 @@ export function streamViaCli(
         if (!msg) return;
 
         if (msg.type === "stream_event") {
+          const progressText = subAgentProgress.handleEvent(
+            msg.event,
+            msg.parent_tool_use_id,
+          );
+          if (progressText) {
+            bridge.emitEphemeralStatus(progressText);
+          }
+
           // Only forward top-level events to pi's event bridge.
           // Sub-agent events (parent_tool_use_id !== null) are internal to the CLI.
-          const isTopLevel = !(msg as any).parent_tool_use_id;
+          const isTopLevel = !msg.parent_tool_use_id;
           if (isTopLevel) {
             bridge.handleEvent(msg.event);
           }
@@ -313,6 +323,11 @@ export function streamViaCli(
             rl.close();
             return; // Don't process further -- done event already pushed by event bridge
           }
+        } else if (msg.type === "system") {
+          const progressText = subAgentProgress.handleSystemMessage(msg);
+          if (progressText) {
+            bridge.emitEphemeralStatus(progressText);
+          }
         } else if (msg.type === "control_request") {
           handleControlRequest(msg, proc!.stdin!);
         } else if (msg.type === "result") {
@@ -343,7 +358,7 @@ export function streamViaCli(
       // inside handleMessageStop prevents pi from executing tools.
       // Guard with streamEnded to avoid pushing done after an error was already pushed.
       if (!streamEnded) {
-        const output = bridge.getOutput();
+        const output = bridge.getFinalOutput();
 
         // If stopReason is toolUse but there are no pi-known tool calls in content,
         // it means only user MCP tools were called (filtered by event bridge).
