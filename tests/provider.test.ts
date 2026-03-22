@@ -359,9 +359,12 @@ describe("streamViaCli", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     const proc = (spawn as any).mock.results[0].value;
-    proc.stdin.emit("error", Object.assign(new Error("write EPIPE"), {
-      code: "EPIPE",
-    }));
+    proc.stdin.emit(
+      "error",
+      Object.assign(new Error("write EPIPE"), {
+        code: "EPIPE",
+      }),
+    );
     proc.stdout.write(
       JSON.stringify({
         type: "result",
