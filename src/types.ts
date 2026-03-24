@@ -5,6 +5,7 @@
 export interface ClaudeStreamEventMessage {
   type: "stream_event";
   event: ClaudeApiEvent;
+  parent_tool_use_id?: string | null;
 }
 
 export interface ClaudeResultMessage {
@@ -12,6 +13,8 @@ export interface ClaudeResultMessage {
   subtype: "success" | "error";
   result?: string;
   error?: string;
+  is_error?: boolean;
+  stop_reason?: string;
   session_id?: string;
 }
 
@@ -20,6 +23,20 @@ export interface ClaudeSystemMessage {
   subtype: string;
   session_id?: string;
   tools?: unknown[];
+  tool_use_id?: string;
+  task_id?: string;
+  task_type?: string;
+  prompt?: string;
+  description?: string;
+  status?: string;
+  last_tool_name?: string;
+  output_file?: string;
+  summary?: string;
+  usage?: {
+    total_tokens?: number;
+    tool_uses?: number;
+    duration_ms?: number;
+  };
 }
 
 export interface ClaudeControlRequest {
@@ -82,4 +99,5 @@ export interface TrackedContentBlock {
   type: "text" | "thinking";
   text: string;
   index: number; // Claude's content_block index
+  contentIndex: number; // Position in output.content
 }

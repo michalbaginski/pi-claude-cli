@@ -45,8 +45,41 @@ import {
   getSessionId,
   setSessionId,
 } from "./session-manager.js";
+import { createSubAgentProgressTracker } from "./subagent-progress.js";
 /** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
 const INACTIVITY_TIMEOUT_MS = 180_000;
+const CONTEXT_LIMIT_ERROR_PATTERNS = [
+  /prompt is too long/i,
+  /context(?: window| length)?(?: is)? too long/i,
+  /context(?: window| length)?.*(?:exceed|limit|maximum)/i,
+  /(?:prompt|input).*(?:exceed|limit).*(?:token|context)/i,
+  /too many tokens/i,
+];
+
+function trimErrorMessage(message?: string | null): string | undefined {
+  const trimmed = message?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function getContextLimitError(
+  ...messages: Array<string | undefined>
+): string | undefined {
+  for (const message of messages) {
+    const trimmed = trimErrorMessage(message);
+    if (!trimmed) continue;
+
+    const isContextLimit = CONTEXT_LIMIT_ERROR_PATTERNS.some((pattern) =>
+      pattern.test(trimmed),
+    );
+    if (!isContextLimit) continue;
+
+    return /^context too long:/i.test(trimmed)
+      ? trimmed
+      : `Context too long: ${trimmed}`;
+  }
+
+  return undefined;
+}
 
 /** Extended stream options: pi's SimpleStreamOptions plus optional cwd and mcpConfigPath */
 type StreamViaCLiOptions = SimpleStreamOptions & {
@@ -123,11 +156,19 @@ export function streamViaCli(
       // Register in global process registry for teardown cleanup
       registerProcess(proc);
 
+      proc.stdin?.on("error", (err: NodeJS.ErrnoException) => {
+        // Claude may close stdin early when it rejects an oversized prompt.
+        // Ignore EPIPE so stdout/result handling can surface the real error.
+        if (err.code === "EPIPE") return;
+        endStreamWithError(err.message);
+      });
+
       // Write user message to subprocess stdin
       writeUserMessage(proc, prompt);
 
       // Create event bridge (before endStreamWithError so bridge is in scope)
       const bridge = createEventBridge(stream, model);
+      const subAgentProgress = createSubAgentProgressTracker();
 
       // Guard against double stream.end() and double error events.
       // First error path wins; subsequent ones are no-ops.
@@ -145,7 +186,7 @@ export function streamViaCli(
       function endStreamWithError(errMsg: string) {
         if (streamEnded || broken) return;
         streamEnded = true;
-        const output = bridge.getOutput();
+        const output = bridge.getFinalOutput();
         const errorMessage = {
           ...output,
           content: output.content?.length
@@ -206,7 +247,11 @@ export function streamViaCli(
         if (broken) return; // Break-early killed the process intentionally
         clearSessionId(sessionKey);
         const stderr = getStderr();
-        endStreamWithError(stderr || err.message);
+        endStreamWithError(
+          getContextLimitError(stderr, err.message) ||
+            trimErrorMessage(stderr) ||
+            err.message,
+        );
       });
 
       // Handle subprocess close -- surface crashes with stderr and exit code
@@ -216,9 +261,11 @@ export function streamViaCli(
         if (code !== 0 && code !== null) {
           clearSessionId(sessionKey);
           const stderr = getStderr();
-          const message = stderr
-            ? `Claude CLI exited with code ${code}: ${stderr.trim()}`
-            : `Claude CLI exited unexpectedly with code ${code}`;
+          const message =
+            getContextLimitError(stderr) ||
+            (stderr
+              ? `Claude CLI exited with code ${code}: ${stderr.trim()}`
+              : `Claude CLI exited unexpectedly with code ${code}`);
           endStreamWithError(message);
         }
       });
@@ -239,9 +286,17 @@ export function streamViaCli(
         if (!msg) return;
 
         if (msg.type === "stream_event") {
+          const progressText = subAgentProgress.handleEvent(
+            msg.event,
+            msg.parent_tool_use_id,
+          );
+          if (progressText) {
+            bridge.emitEphemeralStatus(progressText);
+          }
+
           // Only forward top-level events to pi's event bridge.
           // Sub-agent events (parent_tool_use_id !== null) are internal to the CLI.
-          const isTopLevel = !(msg as any).parent_tool_use_id;
+          const isTopLevel = !msg.parent_tool_use_id;
           if (isTopLevel) {
             bridge.handleEvent(msg.event);
           }
@@ -274,19 +329,31 @@ export function streamViaCli(
             rl.close();
             return; // Don't process further -- done event already pushed by event bridge
           }
-        } else if (msg.type === "control_request") {
-          handleControlRequest(msg, proc!.stdin!);
         } else if (msg.type === "system") {
+          const progressText = subAgentProgress.handleSystemMessage(msg);
+          if (progressText) {
+            bridge.emitEphemeralStatus(progressText);
+          }
           if (msg.session_id) {
             setSessionId(sessionKey, msg.session_id);
           }
+        } else if (msg.type === "control_request") {
+          handleControlRequest(msg, proc!.stdin!);
         } else if (msg.type === "result") {
           if (msg.session_id) {
             setSessionId(sessionKey, msg.session_id);
           }
-          if (msg.subtype === "error") {
+          const cliReportedError = msg.subtype === "error" || msg.is_error;
+          if (cliReportedError) {
             clearSessionId(sessionKey);
-            endStreamWithError(msg.error ?? "Unknown error from Claude CLI");
+            const stderr = getStderr();
+            endStreamWithError(
+              getContextLimitError(msg.error, msg.result, stderr) ||
+                trimErrorMessage(msg.error) ||
+                trimErrorMessage(msg.result) ||
+                trimErrorMessage(stderr) ||
+                "Unknown error from Claude CLI",
+            );
           }
           // For both success and error: clean up the subprocess
           clearTimeout(inactivityTimer);
@@ -304,7 +371,7 @@ export function streamViaCli(
       // inside handleMessageStop prevents pi from executing tools.
       // Guard with streamEnded to avoid pushing done after an error was already pushed.
       if (!streamEnded) {
-        const output = bridge.getOutput();
+        const output = bridge.getFinalOutput();
 
         // If stopReason is toolUse but there are no pi-known tool calls in content,
         // it means only user MCP tools were called (filtered by event bridge).

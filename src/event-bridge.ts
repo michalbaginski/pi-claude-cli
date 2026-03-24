@@ -21,6 +21,7 @@ import {
 interface TrackedToolBlock {
   type: "tool_use";
   index: number;
+  contentIndex: number;
   id: string;
   name: string; // Already mapped to pi name
   claudeName: string; // Original Claude name for arg translation
@@ -39,7 +40,9 @@ type TrackedBlock = TrackedContentBlock | TrackedToolBlock;
  */
 export interface EventBridge {
   handleEvent(event: ClaudeApiEvent): void;
+  emitEphemeralStatus(text: string): void;
   getOutput(): AssistantMessage;
+  getFinalOutput(): AssistantMessage;
 }
 
 /**
@@ -96,6 +99,7 @@ export function createEventBridge(
   };
 
   let started = false;
+  let lastEphemeralStatus: string | undefined;
 
   function handleEvent(event: ClaudeApiEvent): void {
     // Emit start event on first message — tells pi to begin incremental rendering
@@ -147,24 +151,28 @@ export function createEventBridge(
     const blockType = event.content_block?.type;
 
     if (blockType === "text") {
+      const contentIndex = output.content.length;
       const block: TrackedContentBlock = {
         type: "text",
         text: "",
         index: event.index ?? 0,
+        contentIndex,
       };
       blocks.push(block);
       output.content.push({ type: "text" as const, text: "" });
 
       stream.push({
         type: "text_start",
-        contentIndex: output.content.length - 1,
+        contentIndex,
         partial: output,
       });
     } else if (blockType === "thinking") {
+      const contentIndex = output.content.length;
       const block: TrackedContentBlock = {
         type: "thinking",
         text: "",
         index: event.index ?? 0,
+        contentIndex,
       };
       blocks.push(block);
       output.content.push({
@@ -175,7 +183,7 @@ export function createEventBridge(
 
       stream.push({
         type: "thinking_start",
-        contentIndex: output.content.length - 1,
+        contentIndex,
         partial: output,
       });
     } else if (blockType === "tool_use") {
@@ -189,10 +197,12 @@ export function createEventBridge(
 
       const piName = mapClaudeToolNameToPi(claudeName);
       const id = event.content_block!.id!;
+      const contentIndex = output.content.length;
 
       const block: TrackedToolBlock = {
         type: "tool_use",
         index: event.index ?? 0,
+        contentIndex,
         id,
         name: piName,
         claudeName,
@@ -209,7 +219,7 @@ export function createEventBridge(
 
       stream.push({
         type: "toolcall_start",
-        contentIndex: output.content.length - 1,
+        contentIndex,
         partial: output,
       });
     }
@@ -224,14 +234,15 @@ export function createEventBridge(
       if (idx === -1) return;
 
       const block = blocks[idx];
+      const contentIndex = block.contentIndex;
       if (block.type === "text") {
         block.text += event.delta!.text;
-        const contentBlock = output.content[idx] as TextContent;
+        const contentBlock = output.content[contentIndex] as TextContent;
         contentBlock.text = block.text;
 
         stream.push({
           type: "text_delta",
-          contentIndex: idx,
+          contentIndex,
           delta: event.delta!.text,
           partial: output,
         });
@@ -244,14 +255,15 @@ export function createEventBridge(
       if (idx === -1) return;
 
       const block = blocks[idx];
+      const contentIndex = block.contentIndex;
       if (block.type === "thinking") {
         block.text += event.delta!.thinking;
-        const contentBlock = output.content[idx] as ThinkingContent;
+        const contentBlock = output.content[contentIndex] as ThinkingContent;
         contentBlock.thinking = block.text;
 
         stream.push({
           type: "thinking_delta",
-          contentIndex: idx,
+          contentIndex,
           delta: event.delta!.thinking,
           partial: output,
         });
@@ -264,20 +276,21 @@ export function createEventBridge(
       if (idx === -1) return;
 
       const block = blocks[idx];
+      const contentIndex = block.contentIndex;
       if (block.type === "tool_use") {
         block.partialJson += event.delta!.partial_json;
 
         // Try to parse accumulated JSON -- on success update args, on failure keep previous
         try {
           block.arguments = JSON.parse(block.partialJson);
-          (output.content[idx] as any).arguments = block.arguments;
+          (output.content[contentIndex] as any).arguments = block.arguments;
         } catch {
           // Partial JSON not yet parseable -- keep previous arguments
         }
 
         stream.push({
           type: "toolcall_delta",
-          contentIndex: idx,
+          contentIndex,
           delta: event.delta!.partial_json,
           partial: output,
         });
@@ -291,8 +304,9 @@ export function createEventBridge(
       if (idx === -1) return;
 
       const block = blocks[idx];
+      const contentIndex = block.contentIndex;
       if (block.type === "thinking") {
-        const contentBlock = output.content[idx] as ThinkingContent;
+        const contentBlock = output.content[contentIndex] as ThinkingContent;
         contentBlock.thinkingSignature =
           (contentBlock.thinkingSignature || "") + event.delta!.signature;
       }
@@ -304,20 +318,21 @@ export function createEventBridge(
     if (idx === -1) return;
 
     const block = blocks[idx];
+    const contentIndex = block.contentIndex;
     // Clean up the tracking index from the block (no longer needed)
     delete (block as any).index;
 
     if (block.type === "text") {
       stream.push({
         type: "text_end",
-        contentIndex: idx,
+        contentIndex,
         content: block.text,
         partial: output,
       });
     } else if (block.type === "thinking") {
       stream.push({
         type: "thinking_end",
-        contentIndex: idx,
+        contentIndex,
         content: block.text,
         partial: output,
       });
@@ -332,7 +347,7 @@ export function createEventBridge(
       }
 
       // Update output.content with final arguments
-      const contentBlock = output.content[idx] as ToolCall;
+      const contentBlock = output.content[contentIndex] as ToolCall;
       (contentBlock as any).arguments = finalArgs;
 
       // ToolCall.arguments is typed as Record<string, any> in pi-ai, but we
@@ -347,7 +362,7 @@ export function createEventBridge(
 
       stream.push({
         type: "toolcall_end",
-        contentIndex: idx,
+        contentIndex,
         toolCall,
         partial: output,
       });
@@ -378,8 +393,59 @@ export function createEventBridge(
     // Pushing done here (synchronously) prevents pi from executing tools.
   }
 
+  function emitEphemeralStatus(text: string): void {
+    const trimmed = text.trim();
+    if (!trimmed || trimmed === lastEphemeralStatus) return;
+
+    if (!started) {
+      stream.push({ type: "start", partial: output });
+      started = true;
+    }
+
+    lastEphemeralStatus = trimmed;
+    const contentIndex = output.content.length;
+    const contentBlock = {
+      type: "text" as const,
+      text: trimmed,
+      __ephemeral: true,
+    };
+    (output.content as any).push(contentBlock);
+
+    stream.push({
+      type: "text_start",
+      contentIndex,
+      partial: output,
+    });
+    stream.push({
+      type: "text_delta",
+      contentIndex,
+      delta: trimmed,
+      partial: output,
+    });
+    stream.push({
+      type: "text_end",
+      contentIndex,
+      content: trimmed,
+      partial: output,
+    });
+  }
+
+  function getSanitizedOutput(): AssistantMessage {
+    return {
+      ...output,
+      content: output.content
+        .filter((block: any) => !block.__ephemeral)
+        .map((block: any) => {
+          const { __ephemeral, ...rest } = block;
+          return rest;
+        }),
+    };
+  }
+
   return {
     handleEvent,
+    emitEphemeralStatus,
     getOutput: () => output,
+    getFinalOutput: getSanitizedOutput,
   };
 }
